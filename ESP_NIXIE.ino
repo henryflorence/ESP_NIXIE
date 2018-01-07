@@ -16,15 +16,15 @@
 #include <ESP8266WiFi.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
-#include <TimeLib.h>
-#include <Timezone.h>
+#include "TimeLib.h"
+#include "Timezone.h"
 #include <Wire.h>
-#include <WiFiManager.h>
+#include "WiFiManager.h"
 #include <EEPROM.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <Switch.h>
-
+#include "Switch.h"
+#include <ESP8266WebServer.h>
 
 #define D0 16 // LED_BUILTIN
 #define D1 5 // I2C Bus SCL (clock)
@@ -45,6 +45,12 @@ const int clockPin = D7; // SRCLK (pin 11)
 const int encoderPinA = D9;
 const int encoderPinB = D10;
 const int encoderButtonPin = D0;
+
+#ifdef DEBUG_ESP_PORT
+#define DEBUG_MSG(...) DEBUG_ESP_PORT.printf( __VA_ARGS__ )
+#else
+#define DEBUG_MSG(...)
+#endif
 
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "time.nist.gov", 0, 7200000); // Update time every two hours
@@ -74,6 +80,56 @@ const int EEPROM_addr_DST = 1;
 
 bool enableDST;  // Flag to enable DST
 
+std::unique_ptr<ESP8266WebServer> server;
+
+//String webPage = "";
+
+
+void updateSettings() {
+  if(!server->hasArg("offset")) {
+    server->send(500, "text/plain", "malformed GET string");
+    return;
+  }
+
+  enableDST = server->hasArg("dst");
+  int UTC_STD_Offset = ((server->arg("offset").toInt() + 12) % 24) - 12;
+  mySTD.offset = UTC_STD_Offset * 60;
+  myDST.offset = mySTD.offset;
+  if (enableDST) {
+    myDST.offset += 60;
+  }
+  myTZ = Timezone(myDST, mySTD);
+
+  EEPROM.write(EEPROM_addr_UTC_offset, (unsigned char)(mod(mySTD.offset/60,24))); 
+  EEPROM.commit();
+
+  EEPROM.write(EEPROM_addr_DST, (unsigned char)enableDST);
+  EEPROM.commit();  
+  
+//    String msg;
+//    msg += "updating settings:\n";
+//    msg += "utc offset = ";
+//    msg += server->arg("offset");
+//    msg += "\ndst enabled = ";
+//    msg += enableDST ? "true" : "false";
+//    server->send(200, "text/plain", msg);
+  server->send(200, "text/html", "<meta http-equiv=\"refresh\" content=\"0; url=/\" />");
+}
+
+void homePage() {
+  String webPage;
+  String dst = enableDST ? " checked" :  "";
+  int utc_offset = mySTD.offset / 60;
+    
+  char tbuffer[300];
+  sprintf(tbuffer, "<h1>ESP8266 Nixie Clock Settings</h1><form action=\"update\"><p><label><input name=\"offset\" type=\"number\" value=\"%i\"\" style=\"width: 40px;\">&nbsp;UTC Offset</label></p>", utc_offset);
+  webPage += tbuffer;
+  webPage += "<p><label><input name=\"dst\" type=\"checkBox\"" + dst + ">&nbsp;Enable DST</label></p>";
+  //webPage += "<p><label><input name=\"dst\" type=\"checkBox\"" + dst + ">&nbsp;Enable DST</label></p>";
+  webPage += "<p><input type=\"submit\" value=\"Update\"></p>"; //&nbsp;<a href=\"resetWifi\"><button>Reset Wifi</button></a></p>";
+  server->send(200, "text/html", webPage);
+}
+
 void setup() {
   pinMode(dataPin, OUTPUT);
   pinMode(latchPin, OUTPUT);
@@ -99,7 +155,7 @@ void setup() {
     // Setup WiFiManager
   WiFiManager MyWifiManager;
   MyWifiManager.setAPCallback(configModeCallback);
-  MyWifiManager.autoConnect("ESPCLOCK");
+  MyWifiManager.autoConnect("NIXIE_CLOCK");
   
   display.clearDisplay();
   display.setCursor(0,0);
@@ -111,11 +167,11 @@ void setup() {
   display.setCursor(0,28);
   display.println("Updating local time");
   display.display();
-  while (!timeClient.update()) {
-    delay(500);
-    display.print(".");
-    display.display();
-  }
+//  while (!timeClient.update()) {
+//    delay(500);
+//    display.print(".");
+//    display.display();
+//  }
 
   EEPROM.begin(2);
   // Read Daylight Savings Time setting from EEPROM
@@ -132,24 +188,33 @@ void setup() {
 
   menu = TOP;
   updateSelection();
+
+  //utc_offset = 1;
+
+  server.reset(new ESP8266WebServer(WiFi.localIP(), 80));
+  
+  server->on("/", homePage);
+  server->on("/update", updateSettings);
+  server->begin();
 }
+
 
 time_t prevTime = 0;
 bool initial_loop = 1;
 
 void loop() {
   
-  updateEncoderPos();
-  encoderButton.poll();
-
-  if (encoderButton.pushed()) {
-    if (initial_loop == 1) {
-      initial_loop = 0;  // Ignore first push
-    }
-    else {
-      updateMenu();
-    }
-   }
+//  updateEncoderPos();
+//  encoderButton.poll();
+//
+//  if (encoderButton.pushed()) {
+//    if (initial_loop == 1) {
+//      initial_loop = 0;  // Ignore first push
+//    }
+//    else {
+//      updateMenu();
+//    }
+//   }
 
   timeClient.update();
   setTime(myTZ.toLocal(timeClient.getEpochTime()));
@@ -158,6 +223,8 @@ void loop() {
     prevTime = now();
     displayTime();
   }
+  //Serial.printf("loop");
+  server->handleClient();
 }
 
 void displayTime(){
@@ -291,8 +358,10 @@ void updateSelection() { // Called whenever encoder is turned
       display.setTextColor(WHITE,BLACK);
       display.setCursor(0,0);
       display.print("Wifi Connected");
-      display.setCursor(0,56);
-      display.print("Click for settings");
+      display.setCursor(20,46);
+      display.print(WiFi.localIP());
+      //display.setCursor(0,56);
+      //display.print("Click for settings");
       break;
     case SETTINGS:
       display.setCursor(0,0); 
