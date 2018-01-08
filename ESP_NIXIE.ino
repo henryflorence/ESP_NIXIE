@@ -77,8 +77,10 @@ enum Menu {
 // EEPROM addresses
 const int EEPROM_addr_UTC_offset = 0; 
 const int EEPROM_addr_DST = 1;  
+const int EEPROM_addr_24hr = 2;
 
 bool enableDST;  // Flag to enable DST
+bool twenty4hour;
 
 std::unique_ptr<ESP8266WebServer> server;
 
@@ -98,6 +100,7 @@ void updateSettings() {
   if (enableDST) {
     myDST.offset += 60;
   }
+  twenty4hour = server->hasArg("twenty4hour"); 
   myTZ = Timezone(myDST, mySTD);
 
   EEPROM.write(EEPROM_addr_UTC_offset, (unsigned char)(mod(mySTD.offset/60,24))); 
@@ -105,27 +108,33 @@ void updateSettings() {
 
   EEPROM.write(EEPROM_addr_DST, (unsigned char)enableDST);
   EEPROM.commit();  
+
+  EEPROM.write(EEPROM_addr_24hr, (unsigned char)twenty4hour);
+  EEPROM.commit();  
   
-//    String msg;
-//    msg += "updating settings:\n";
-//    msg += "utc offset = ";
-//    msg += server->arg("offset");
-//    msg += "\ndst enabled = ";
-//    msg += enableDST ? "true" : "false";
-//    server->send(200, "text/plain", msg);
+  String msg;
+//  msg += "updating settings:\n";
+//  msg += "utc offset = ";
+//  msg += server->arg("offset");
+//  msg += "\ndst enabled = ";
+//  msg += enableDST ? "true" : "false";
+//  msg += "\n24 hour clock = ";
+//  msg += twenty4hour ? "true" : "false";
+//  server->send(200, "text/plain", msg);
   server->send(200, "text/html", "<meta http-equiv=\"refresh\" content=\"0; url=/\" />");
 }
 
 void homePage() {
   String webPage;
   String dst = enableDST ? " checked" :  "";
+  String twenty4 = twenty4hour ? " checked" : "";
   int utc_offset = mySTD.offset / 60;
     
   char tbuffer[300];
   sprintf(tbuffer, "<h1>ESP8266 Nixie Clock Settings</h1><form action=\"update\"><p><label><input name=\"offset\" type=\"number\" value=\"%i\"\" style=\"width: 40px;\">&nbsp;UTC Offset</label></p>", utc_offset);
   webPage += tbuffer;
   webPage += "<p><label><input name=\"dst\" type=\"checkBox\"" + dst + ">&nbsp;Enable DST</label></p>";
-  //webPage += "<p><label><input name=\"dst\" type=\"checkBox\"" + dst + ">&nbsp;Enable DST</label></p>";
+  webPage += "<p><label><input name=\"twenty4hour\" type=\"checkBox\"" + twenty4 + ">&nbsp;24 hour clock</label></p>";
   webPage += "<p><input type=\"submit\" value=\"Update\"></p>"; //&nbsp;<a href=\"resetWifi\"><button>Reset Wifi</button></a></p>";
   server->send(200, "text/html", webPage);
 }
@@ -173,7 +182,7 @@ void setup() {
 //    display.display();
 //  }
 
-  EEPROM.begin(2);
+  EEPROM.begin(3);
   // Read Daylight Savings Time setting from EEPROM
   enableDST = EEPROM.read(EEPROM_addr_DST) != 0;
   
@@ -186,6 +195,8 @@ void setup() {
   }
   myTZ = Timezone(myDST, mySTD);
 
+  twenty4hour = EEPROM.read(EEPROM_addr_24hr) != 0;
+  
   menu = TOP;
   updateSelection();
 
@@ -229,9 +240,9 @@ void loop() {
 
 void displayTime(){
    char tod[10], time_str[20], date_str[20];
-   const char* am_pm[] = {"AM", "PM"};
+   const char* am_pm[] = {" AM", " PM"};
    const char* month_names[] = {"Jan", "Feb", "March", "April", "May", "June", "July", "Aug", "Sept", "Oct", "Nov", "Dec"};
-   unsigned char hourBcd = decToBcd((unsigned char)hourFormat12());
+   unsigned char hourBcd = decToBcd((unsigned char)(twenty4hour ? hour() : hourFormat12()));
 
    if ((hourBcd >> 4) == 0) { // If 10's digit is zero, we don't want to display a zero
     hourBcd |= (15 << 4); 
@@ -244,8 +255,9 @@ void displayTime(){
    digitalWrite(latchPin, HIGH);
    
    if ((menu == TOP) || (menu == SET_UTC_OFFSET)) {
-      formattedTime(tod, hourFormat12(), minute(), second());
-      sprintf(time_str, "%s %s", tod, am_pm[isPM()]);
+      int hours = twenty4hour ? hour() : hourFormat12();
+      formattedTime(tod, hours, minute(), second());
+      sprintf(time_str, "%s%s", tod, twenty4hour ? "" : am_pm[isPM()] );
       sprintf(date_str, "%s %d, %d", month_names[month() - 1], day(), year());
       display.fillRect(20,28,120,8,BLACK);
       display.setCursor(20,28);
