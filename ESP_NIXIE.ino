@@ -25,7 +25,6 @@
 #include <Adafruit_SSD1306.h>
 #include <Switch.h>
 #include <ESP8266WebServer.h>
-
 #define D0 16 // LED_BUILTIN
 #define D1 5 // I2C Bus SCL (clock)
 #define D2 4 // I2C Bus SDA (data)
