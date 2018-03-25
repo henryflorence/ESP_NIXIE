@@ -25,6 +25,17 @@
 #include <Adafruit_SSD1306.h>
 #include <Switch.h>
 #include <ESP8266WebServer.h>
+
+WiFiClient client;
+
+const char* timezonedbAPIkey = "57J1MAM4QACH";
+char timezonedbLocation[50] = "Europe/London";
+long dstChange1 = -1;
+long dstChange2 = -1;
+char dstState = -1;
+
+#include <timezonedb.h>
+
 #define D0 16 // LED_BUILTIN
 #define D1 5 // I2C Bus SCL (clock)
 #define D2 4 // I2C Bus SDA (data)
@@ -45,11 +56,11 @@ const int encoderPinA = D9;
 const int encoderPinB = D10;
 const int encoderButtonPin = D0;
 
-#ifdef DEBUG_ESP_PORT
-#define DEBUG_MSG(...) DEBUG_ESP_PORT.printf( __VA_ARGS__ )
-#else
-#define DEBUG_MSG(...)
-#endif
+//#ifdef DEBUG_ESP_PORT
+//#define DEBUG_MSG(...) DEBUG_ESP_PORT.printf( __VA_ARGS__ )
+//#else
+//#define DEBUG_MSG(...)
+//#endif
 
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "time.nist.gov", 0, 7200000); // Update time every two hours
@@ -62,7 +73,6 @@ Timezone myTZ(myDST, mySTD);
 #define OLED_RESET  LED_BUILTIN
 Adafruit_SSD1306 display(OLED_RESET);
 
-Switch encoderButton = Switch(encoderButtonPin, INPUT_PULLUP);
 int encoderPos, encoderPosPrev;
 
 enum Menu {
@@ -77,14 +87,12 @@ enum Menu {
 const int EEPROM_addr_UTC_offset = 0; 
 const int EEPROM_addr_DST = 1;  
 const int EEPROM_addr_24hr = 2;
+const int EEPROM_addr_timezone = 3;
 
 bool enableDST;  // Flag to enable DST
 bool twenty4hour;
 
 std::unique_ptr<ESP8266WebServer> server;
-
-//String webPage = "";
-
 
 void updateSettings() {
   if(!server->hasArg("offset")) {
@@ -99,7 +107,13 @@ void updateSettings() {
   if (enableDST) {
     myDST.offset += 60;
   }
+  
   twenty4hour = server->hasArg("twenty4hour"); 
+  
+  String tzText = server->arg("timezone");
+  tzText.replace("%2F", "/");
+  tzText.toCharArray(timezonedbLocation, 50);
+  
   myTZ = Timezone(myDST, mySTD);
 
   EEPROM.write(EEPROM_addr_UTC_offset, (unsigned char)(mod(mySTD.offset/60,24))); 
@@ -110,6 +124,12 @@ void updateSettings() {
 
   EEPROM.write(EEPROM_addr_24hr, (unsigned char)twenty4hour);
   EEPROM.commit();  
+
+  for(int i=0; i < 50; i++)
+    EEPROM.write(EEPROM_addr_timezone + i, timezonedbLocation[i]);
+  EEPROM.commit();
+
+  dstState = -1;
   
   String msg;
 //  msg += "updating settings:\n";
@@ -127,18 +147,22 @@ void homePage() {
   String webPage;
   String dst = enableDST ? " checked" :  "";
   String twenty4 = twenty4hour ? " checked" : "";
+  String timezone = String(timezonedbLocation);
   int utc_offset = mySTD.offset / 60;
     
   char tbuffer[300];
   sprintf(tbuffer, "<h1>ESP8266 Nixie Clock Settings</h1><form action=\"update\"><p><label><input name=\"offset\" type=\"number\" value=\"%i\"\" style=\"width: 40px;\">&nbsp;UTC Offset</label></p>", utc_offset);
   webPage += tbuffer;
   webPage += "<p><label><input name=\"dst\" type=\"checkBox\"" + dst + ">&nbsp;Enable DST</label></p>";
+  webPage += "<p><label><input name=\"timezone\" type=\"text\" value=\"" + timezone + "\">&nbsp;Use timezonedb.com - leave blank to ignore";
   webPage += "<p><label><input name=\"twenty4hour\" type=\"checkBox\"" + twenty4 + ">&nbsp;24 hour clock</label></p>";
   webPage += "<p><input type=\"submit\" value=\"Update\"></p>"; //&nbsp;<a href=\"resetWifi\"><button>Reset Wifi</button></a></p>";
   server->send(200, "text/html", webPage);
 }
 
 void setup() {
+  Serial.begin(115200);
+  
   pinMode(dataPin, OUTPUT);
   pinMode(latchPin, OUTPUT);
   pinMode(clockPin, OUTPUT); 
@@ -175,13 +199,8 @@ void setup() {
   display.setCursor(0,28);
   display.println("Updating local time");
   display.display();
-//  while (!timeClient.update()) {
-//    delay(500);
-//    display.print(".");
-//    display.display();
-//  }
 
-  EEPROM.begin(3);
+  EEPROM.begin(53);
   // Read Daylight Savings Time setting from EEPROM
   enableDST = EEPROM.read(EEPROM_addr_DST) != 0;
   
@@ -195,7 +214,10 @@ void setup() {
   myTZ = Timezone(myDST, mySTD);
 
   twenty4hour = EEPROM.read(EEPROM_addr_24hr) != 0;
-  
+
+  for(int i=0; i < 50; i++)
+    timezonedbLocation[i] = EEPROM.read(EEPROM_addr_timezone + i);
+
   menu = TOP;
   updateSelection();
 
@@ -206,32 +228,54 @@ void setup() {
   server->on("/", homePage);
   server->on("/update", updateSettings);
   server->begin();
+
+  Serial.println("end of setup");
 }
 
+void updateTzUsingTimezone(long gmtEpoch) {
+  long gmtOffset;
+  boolean dst = 0;
+  getTimezoneDst(&dst, &dstChange1, &dstChange2, &gmtOffset);
+  if(dst == 0) dstState = -2;
+  else {
+    if(gmtEpoch < dstChange1) dstState = 0;
+    else if(gmtEpoch < dstChange2) dstState = 1;
+    else if(gmtEpoch > dstChange2) dstState = 2;
+  }
+  display.println("sausage");
+  display.display();
+  mySTD.offset = gmtOffset / 60;
+  myDST.offset = mySTD.offset;
+  myTZ = Timezone(myDST, mySTD);
+}
+
+long checkTimezonedb(long gmtEpoch) {
+  // fetch tz offset if uninitialised
+  if(dstState == -1) {
+    updateTzUsingTimezone(gmtEpoch);
+  // if the timezone has dst and the time has changed across the dstchange dates update tz
+  } else if( dstState > -1) {
+    if((gmtEpoch < dstChange1 && dstState != 0) ||
+        (gmtEpoch < dstChange2 && dstState != 1) ||
+        (gmtEpoch > dstChange2 && dstState != 2)) {
+        updateTzUsingTimezone(gmtEpoch);     
+      }
+  }
+}
 
 time_t prevTime = 0;
 bool initial_loop = 1;
 
 void loop() {
-  
-//  updateEncoderPos();
-//  encoderButton.poll();
-//
-//  if (encoderButton.pushed()) {
-//    if (initial_loop == 1) {
-//      initial_loop = 0;  // Ignore first push
-//    }
-//    else {
-//      updateMenu();
-//    }
-//   }
-
   timeClient.update();
+  if(strcmp(timezonedbLocation, "") != 0) 
+    //checkTimezonedb(timeClient.getEpochTime());
   setTime(myTZ.toLocal(timeClient.getEpochTime()));
 
   if (now() != prevTime) {
     prevTime = now();
     displayTime();
+    Serial.printf("update time");
   }
   //Serial.printf("loop");
   server->handleClient();
@@ -286,168 +330,15 @@ void formattedTime(char *tod, int hours, int minutes, int seconds)
   sprintf(tod, "%d%s%d%s%d", hours, colonDigit(minutes), minutes, colonDigit(seconds), seconds);  // Hours, minutes, seconds
 }
 
-void updateEncoderPos() {
-    static int encoderA, encoderB, encoderA_prev;   
-
-    encoderA = digitalRead(encoderPinA); 
-    encoderB = digitalRead(encoderPinB);
- 
-    if((!encoderA) && (encoderA_prev)){ // A has gone from high to low 
-      encoderPosPrev = encoderPos;
-      encoderB ? encoderPos++ : encoderPos--;  
-      if (menu != TOP) {
-        updateSelection();
-      }    
-    }
-    encoderA_prev = encoderA;     
-}
-
-void updateMenu() {  // Called whenever button is pushed
-
-  switch (menu) {
-    case TOP:
-      menu = SETTINGS;
-      break;
-    case SETTINGS:
-      switch (mod(encoderPos,4)) {
-        case 0: // Reset Wifi
-          menu = RESET_WIFI;
-          break;
-        case 1: // Timezone Offset
-          menu = SET_UTC_OFFSET;
-          break;
-        case 2: // Enable DST
-          menu = ENABLE_DST;
-          break;
-        case 3: // Return
-          menu = TOP;
-          break;
-      }
-      break;
-    case RESET_WIFI:
-      if (mod(encoderPos, 2) == 1){  // Selection = YES
-        resetWiFi();
-        menu = TOP; 
-      }
-      else {  // Selection = NO
-        menu = SETTINGS;
-      }
-      break;
-    case SET_UTC_OFFSET:
-      EEPROM.write(EEPROM_addr_UTC_offset, (unsigned char)(mod(mySTD.offset/60,24))); 
-      EEPROM.commit();
-      menu = TOP;
-      break;
-    case ENABLE_DST:
-      if (mod(encoderPos, 2) == 1){  // Selection = YES
-        enableDST = true;
-      }
-      else {  // Selection = NO
-        enableDST = false;
-      }
-      EEPROM.write(EEPROM_addr_DST, (unsigned char)enableDST);
-      EEPROM.commit();
-      myDST.offset = mySTD.offset;
-      if (enableDST) {
-        myDST.offset += 60;
-      }
-      myTZ = Timezone(myDST, mySTD);   
-      menu = TOP; 
-      break;
-  }
-  encoderPos = 0;  // Reset encoder position
-  encoderPosPrev = 0;
-  updateSelection(); // Refresh screen
-}
-
 void updateSelection() { // Called whenever encoder is turned
-  int UTC_STD_Offset, dispOffset;
-  
   display.clearDisplay();
-  switch (menu) {
-    case TOP:
-      display.setTextColor(WHITE,BLACK);
-      display.setCursor(0,0);
-      display.print("Wifi Connected");
-      display.setCursor(20,46);
-      display.print(WiFi.localIP());
-      //display.setCursor(0,56);
-      //display.print("Click for settings");
-      break;
-    case SETTINGS:
-      display.setCursor(0,0); 
-      display.setTextColor(WHITE,BLACK);
-      display.print("SETTINGS");
-      display.setCursor(0,16);
-      setHighlight(0,4);
-      display.println("Reset Wifi Connection");
-      setHighlight(1,4);
-      display.println("Set Timezone Offset  ");
-      setHighlight(2,4);
-      display.println("Enable Auto DST      ");
-      setHighlight(3,4);
-      display.println("Return               ");
-      break;
-    case RESET_WIFI:
-      display.setCursor(0,0); 
-      display.setTextColor(WHITE,BLACK);
-      display.print("RESET WIFI?");
-      display.setCursor(0,16);
-      setHighlight(0,2);
-      display.println("No                   ");
-      setHighlight(1,2);
-      display.println("Yes                  ");
-      break;  
-    case SET_UTC_OFFSET:
-      UTC_STD_Offset = mySTD.offset/60;
-      if (encoderPos > encoderPosPrev) {
-        UTC_STD_Offset = ((UTC_STD_Offset + 12 + 1) % 24) - 12;
-      } else if (encoderPos < encoderPosPrev) {
-        UTC_STD_Offset = ((UTC_STD_Offset + 12 - 1) % 24) - 12;
-      }
-      mySTD.offset = UTC_STD_Offset * 60;
-      myDST.offset = mySTD.offset;
-      if (enableDST) {
-        myDST.offset += 60;
-      }
-      myTZ = Timezone(myDST, mySTD);
-      
-      display.setCursor(0,0);
-      display.setTextColor(WHITE,BLACK);
-      display.println("SET TIMEZONE OFFSET");
-      display.println();
-      display.print("    UTC ");
-      display.print(UTC_STD_Offset >= 0 ? "+ " : "- ");
-      dispOffset = UTC_STD_Offset;
-      if (enableDST) {
-        if (myTZ.utcIsDST(timeClient.getEpochTime())) {
-          dispOffset += 1;  // Include DST in UTC offset
-        }
-      }
-      display.print(abs(dispOffset));
-      display.print(" hours");
-      displayTime();
-
-      display.setCursor(0,48);
-      display.println("Press knob to");
-      display.print("confirm offset");
-      break;
-    case ENABLE_DST:
-      display.setCursor(0,0); 
-      display.setTextColor(WHITE,BLACK);
-      if (enableDST) {
-        display.print("Auto DST Enabled");
-      }
-      else {
-        display.print("Auto DST Disabled");
-      }
-      display.setCursor(0,16);
-      setHighlight(0,2);
-      display.println("Disable Auto DST     ");
-      setHighlight(1,2);
-      display.println("Enable Auto DST      ");
-      break;
-  }
+  
+  display.setTextColor(WHITE,BLACK);
+  display.setCursor(0,0);
+  display.print("Wifi Connected");
+  display.setCursor(20,46);
+  display.print(WiFi.localIP());
+  
   display.display(); 
 }
 
@@ -455,15 +346,6 @@ void resetWiFi(){
   WiFiManager MyWifiManager;
   MyWifiManager.resetSettings();
   ESP.restart();
-}
-
-void setHighlight(int menuItem, int numMenuItems) {
-  if (mod(encoderPos, numMenuItems) == menuItem) {
-    display.setTextColor(BLACK,WHITE);
-  }
-  else {
-    display.setTextColor(WHITE,BLACK);
-  }
 }
 
 int mod(int a, int b)
